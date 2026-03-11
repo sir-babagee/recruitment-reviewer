@@ -1,6 +1,7 @@
-import { PDFParse } from "pdf-parse";
+import { extractText, getDocumentProxy } from "unpdf";
 
 export const runtime = "nodejs";
+export const maxDuration = 30;
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 
@@ -28,12 +29,10 @@ export async function POST(request: Request) {
     }
 
     const arrayBuffer = await file.arrayBuffer();
-    const data = new Uint8Array(arrayBuffer);
+    const pdf = await getDocumentProxy(new Uint8Array(arrayBuffer));
+    const { totalPages, text } = await extractText(pdf, { mergePages: true });
 
-    const parser = new PDFParse({ data });
-    const result = await parser.getText();
-
-    if (!result.text || result.text.trim().length === 0) {
+    if (!text || text.trim().length === 0) {
       return Response.json(
         {
           error:
@@ -43,10 +42,7 @@ export async function POST(request: Request) {
       );
     }
 
-    return Response.json({
-      text: result.text,
-      pages: result.total,
-    });
+    return Response.json({ text, pages: totalPages });
   } catch (error: unknown) {
     console.error("PDF parse error:", error);
     return Response.json(

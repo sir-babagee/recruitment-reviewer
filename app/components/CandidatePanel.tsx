@@ -80,6 +80,11 @@ export default function CandidatePanel({
         body: formData,
       });
 
+      const contentType = res.headers.get("content-type") || "";
+      if (!contentType.includes("application/json")) {
+        throw new Error("Server error: PDF parsing is temporarily unavailable.");
+      }
+
       const data = await res.json();
 
       if (!res.ok) {
