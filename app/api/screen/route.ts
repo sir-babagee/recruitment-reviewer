@@ -3,8 +3,79 @@ import { generateObject } from "ai";
 import { screeningResultSchema } from "../../lib/schemas";
 import { buildSystemPrompt, buildUserPrompt } from "../../lib/prompts";
 import type { JobSetup, CandidateInput, ScreeningResult } from "../../lib/types";
+import { z } from "zod";
 
 export const maxDuration = 60;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function deepRepairJSON(value: any): any {
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (typeof parsed === "object" && parsed !== null) {
+        return deepRepairJSON(parsed);
+      }
+    } catch {
+      /* not JSON */
+    }
+    return value;
+  }
+  if (Array.isArray(value)) return value.map(deepRepairJSON);
+  if (typeof value === "object" && value !== null) {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = deepRepairJSON(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+async function screenCandidate(
+  job: JobSetup,
+  resumeText: string
+): Promise<z.infer<typeof screeningResultSchema>> {
+  const model = anthropic(
+    process.env.ANTHROPIC_MODEL || "claude-sonnet-4-20250514"
+  );
+  const system = buildSystemPrompt();
+  const prompt = buildUserPrompt(job, resumeText);
+
+  // Attempt 1: tool mode (default) — best when the provider natively constrains output
+  try {
+    const { object } = await generateObject({
+      model,
+      system,
+      prompt,
+      schema: screeningResultSchema,
+    });
+    return object;
+  } catch {
+    /* fall through to JSON mode */
+  }
+
+  // Attempt 2: JSON mode — the model writes free-form JSON, SDK validates against schema
+  try {
+    const { object } = await generateObject({
+      model,
+      system,
+      prompt,
+      schema: screeningResultSchema,
+      mode: "json",
+    });
+    return object;
+  } catch (err: unknown) {
+    // Try to salvage the raw text from the error
+    const raw =
+      err && typeof err === "object" && "text" in err
+        ? (err as { text: string }).text
+        : null;
+    if (!raw) throw err;
+
+    const repaired = deepRepairJSON(JSON.parse(raw));
+    return screeningResultSchema.parse(repaired);
+  }
+}
 
 export async function POST(request: Request) {
   try {
@@ -41,43 +112,7 @@ export async function POST(request: Request) {
 
     const results: ScreeningResult[] = await Promise.all(
       validCandidates.map(async (candidate) => {
-        let object;
-
-        try {
-          const result = await generateObject({
-            model: anthropic(
-              process.env.ANTHROPIC_MODEL || "claude-sonnet-4-20250514"
-            ),
-            system: buildSystemPrompt(),
-            prompt: buildUserPrompt(job, candidate.resumeText),
-            schema: screeningResultSchema,
-          });
-          object = result.object;
-        } catch (err: unknown) {
-          // Anthropic sometimes returns nested arrays/objects as JSON strings.
-          // Extract the raw text, repair the stringified fields, and re-validate.
-          const raw =
-            err && typeof err === "object" && "text" in err
-              ? (err as { text: string }).text
-              : null;
-          if (!raw) throw err;
-
-          const parsed = JSON.parse(raw);
-          for (const key of Object.keys(parsed)) {
-            if (typeof parsed[key] === "string") {
-              try {
-                const maybeParsed = JSON.parse(parsed[key]);
-                if (typeof maybeParsed === "object") {
-                  parsed[key] = maybeParsed;
-                }
-              } catch {
-                // Not JSON, leave as-is
-              }
-            }
-          }
-          object = screeningResultSchema.parse(parsed);
-        }
-
+        const object = await screenCandidate(job, candidate.resumeText);
         return {
           candidateId: candidate.id,
           ...object,
