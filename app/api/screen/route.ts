@@ -1,8 +1,12 @@
 import { anthropic } from "@ai-sdk/anthropic";
-import { generateObject } from "ai";
+import { generateText, Output, NoObjectGeneratedError } from "ai";
 import { screeningResultSchema } from "../../lib/schemas";
 import { buildSystemPrompt, buildUserPrompt } from "../../lib/prompts";
-import type { JobSetup, CandidateInput, ScreeningResult } from "../../lib/types";
+import type {
+  JobSetup,
+  CandidateInput,
+  ScreeningResult,
+} from "../../lib/types";
 import { z } from "zod";
 
 export const maxDuration = 60;
@@ -31,6 +35,81 @@ function deepRepairJSON(value: any): any {
   return value;
 }
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function coerceToSchema(data: any): any {
+  if (typeof data !== "object" || data === null) return data;
+
+  if (typeof data.evidence === "string") {
+    try {
+      data.evidence = JSON.parse(data.evidence);
+    } catch {
+      data.evidence = [
+        {
+          conclusion: data.evidence,
+          supportingQuote: "See resume",
+          resumeSection: "General",
+        },
+      ];
+    }
+  }
+
+  if (Array.isArray(data.evidence)) {
+    while (data.evidence.length < 3) {
+      data.evidence.push({
+        conclusion: "Insufficient data in resume",
+        supportingQuote: "N/A",
+        resumeSection: "General",
+      });
+    }
+  }
+
+  const arrayFields = ["topReasons", "missingRequirements", "followUpQuestions"];
+  if (data.evaluation && typeof data.evaluation === "object") {
+    for (const field of arrayFields) {
+      if (typeof data.evaluation[field] === "string") {
+        try {
+          data.evaluation[field] = JSON.parse(data.evaluation[field]);
+        } catch {
+          data.evaluation[field] = [data.evaluation[field]];
+        }
+      }
+    }
+
+    if (Array.isArray(data.evaluation.topReasons)) {
+      while (data.evaluation.topReasons.length < 3) {
+        data.evaluation.topReasons.push("No additional reason provided");
+      }
+    }
+
+    if (Array.isArray(data.evaluation.followUpQuestions)) {
+      while (data.evaluation.followUpQuestions.length < 3) {
+        data.evaluation.followUpQuestions.push(
+          "What other relevant experience can you share?"
+        );
+      }
+    }
+  }
+
+  if (data.summary && typeof data.summary === "object") {
+    for (const field of [
+      "employmentHistory",
+      "toolsAndPlatforms",
+      "personalityAndHighlights",
+      "flags",
+    ]) {
+      if (typeof data.summary[field] === "string") {
+        try {
+          data.summary[field] = JSON.parse(data.summary[field]);
+        } catch {
+          data.summary[field] = [data.summary[field]];
+        }
+      }
+    }
+  }
+
+  return data;
+}
+
 async function screenCandidate(
   job: JobSetup,
   resumeText: string
@@ -41,39 +120,23 @@ async function screenCandidate(
   const system = buildSystemPrompt();
   const prompt = buildUserPrompt(job, resumeText);
 
-  // Attempt 1: tool mode (default) — best when the provider natively constrains output
   try {
-    const { object } = await generateObject({
+    const { output } = await generateText({
       model,
       system,
       prompt,
-      schema: screeningResultSchema,
+      output: Output.object({ schema: screeningResultSchema }),
     });
-    return object;
-  } catch {
-    /* fall through to JSON mode */
-  }
 
-  // Attempt 2: JSON mode — the model writes free-form JSON, SDK validates against schema
-  try {
-    const { object } = await generateObject({
-      model,
-      system,
-      prompt,
-      schema: screeningResultSchema,
-      mode: "json",
-    });
-    return object;
+    if (output) return output;
+    throw new Error("No output generated");
   } catch (err: unknown) {
-    // Try to salvage the raw text from the error
-    const raw =
-      err && typeof err === "object" && "text" in err
-        ? (err as { text: string }).text
-        : null;
-    if (!raw) throw err;
-
-    const repaired = deepRepairJSON(JSON.parse(raw));
-    return screeningResultSchema.parse(repaired);
+    if (NoObjectGeneratedError.isInstance(err) && err.text) {
+      const raw = deepRepairJSON(JSON.parse(err.text));
+      const coerced = coerceToSchema(raw);
+      return screeningResultSchema.parse(coerced);
+    }
+    throw err;
   }
 }
 
